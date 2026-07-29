@@ -1096,6 +1096,247 @@ app.get("/api/admin/transactions", async (req, res) => {
 
 
 // ----------------------------------------------------
+// TRAINER DASHBOARD ENDPOINTS
+// ----------------------------------------------------
+
+// GET /api/trainer/stats - Trainer Overview Statistics
+app.get("/api/trainer/stats", async (req, res) => {
+  try {
+    const { trainerId, email } = req.query;
+
+    let classFilter = {};
+    if (trainerId && email) {
+      classFilter = { $or: [{ trainerId }, { trainerEmail: email }, { trainerName: email }] };
+    } else if (trainerId) {
+      classFilter = { $or: [{ trainerId }, { "trainer.id": trainerId }] };
+    } else if (email) {
+      classFilter = { trainerEmail: email };
+    }
+
+    const trainerClasses = await db.collection("classes").find(classFilter).toArray();
+    const totalClassesCreated = trainerClasses.length;
+
+    const classIds = trainerClasses.map((c) => c._id.toString());
+    const classIdQueries = trainerClasses.map((c) => c.id).filter(Boolean);
+    const allIds = [...classIds, ...classIdQueries];
+
+    let totalStudentsEnrolled = 0;
+    if (allIds.length > 0) {
+      totalStudentsEnrolled = await db.collection("bookings").countDocuments({
+        classId: { $in: allIds },
+      });
+    }
+
+    res.json({
+      success: true,
+      data: {
+        totalClassesCreated,
+        totalStudentsEnrolled,
+      },
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// GET /api/trainer/classes - Get trainer's owned classes
+app.get("/api/trainer/classes", async (req, res) => {
+  try {
+    const { trainerId, email } = req.query;
+
+    let filter = {};
+    if (trainerId && email) filter = { $or: [{ trainerId }, { trainerEmail: email }] };
+    else if (trainerId) filter = { trainerId };
+    else if (email) filter = { trainerEmail: email };
+
+    const classesList = await db.collection("classes").find(filter).sort({ createdAt: -1 }).toArray();
+
+    // Get student count for each class
+    const formatted = await Promise.all(
+      classesList.map(async (c) => {
+        const id = c._id.toString();
+        const altId = c.id;
+        const enrolledCount = await db.collection("bookings").countDocuments({
+          classId: { $in: [id, altId].filter(Boolean) },
+        });
+
+        return {
+          ...c,
+          id,
+          status: c.status || "Pending",
+          enrolledCount,
+        };
+      })
+    );
+
+    res.json({ success: true, count: formatted.length, data: formatted });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// POST /api/trainer/classes - Create new class (Default Status: "Pending")
+app.post("/api/trainer/classes", async (req, res) => {
+  try {
+    const {
+      className,
+      image,
+      category,
+      difficulty,
+      duration,
+      schedule,
+      price,
+      description,
+      trainerId,
+      trainerEmail,
+      trainerName,
+    } = req.body;
+
+    if (!className || !price) {
+      return res.status(400).json({ success: false, error: "Class Name and Price are required." });
+    }
+
+    if (await isUserBlocked(trainerId, trainerEmail)) {
+      return res.status(403).json({ success: false, error: "Action restricted by Admin" });
+    }
+
+    const newClassDoc = {
+      className,
+      image: image || "https://images.unsplash.com/photo-1518611012118-696072aa579a?q=80&w=800&auto=format&fit=crop",
+      category: category || "General",
+      difficulty: difficulty || "Intermediate",
+      duration: duration || "60 mins",
+      schedule: schedule || "Monday, Wednesday • 9:00 AM",
+      price: Number(price) || 29.99,
+      description: description || "",
+      status: "Pending", // Note: Newly added classes must have a default status of "Pending"
+      trainerId: trainerId || null,
+      trainerEmail: trainerEmail || null,
+      trainerName: trainerName || "Certified Trainer",
+      bookingCount: 0,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    };
+
+    const result = await db.collection("classes").insertOne(newClassDoc);
+
+    res.status(201).json({
+      success: true,
+      message: "Class created successfully! Status is set to Pending awaiting Admin approval.",
+      id: result.insertedId.toString(),
+      status: "Pending",
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// PATCH /api/trainer/classes/:id - Update class details
+app.patch("/api/trainer/classes/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { className, image, category, difficulty, duration, schedule, price, description } = req.body;
+
+    let query = { _id: ObjectId.isValid(id) ? new ObjectId(id) : id };
+
+    await db.collection("classes").updateOne(query, {
+      $set: {
+        className,
+        image,
+        category,
+        difficulty,
+        duration,
+        schedule,
+        price: Number(price),
+        description,
+        updatedAt: new Date(),
+      },
+    });
+
+    res.json({ success: true, message: "Class updated successfully!" });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// DELETE /api/trainer/classes/:id - Delete trainer's class
+app.delete("/api/trainer/classes/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    let query = { _id: ObjectId.isValid(id) ? new ObjectId(id) : id };
+
+    await db.collection("classes").deleteOne(query);
+
+    res.json({ success: true, message: "Class deleted successfully." });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// GET /api/trainer/classes/:id/students - View names and emails of booked students
+app.get("/api/trainer/classes/:id/students", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const bookings = await db.collection("bookings")
+      .find({ classId: { $in: [id, id.toString()] } })
+      .sort({ bookedAt: -1 })
+      .toArray();
+
+    const students = bookings.map((b) => ({
+      id: b._id.toString(),
+      name: b.userName || b.name || "Enrolled Student",
+      email: b.userEmail || b.email || "student@example.com",
+      bookedAt: b.bookedAt ? new Date(b.bookedAt).toLocaleDateString() : new Date().toLocaleDateString(),
+    }));
+
+    res.json({ success: true, count: students.length, data: students });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// GET /api/trainer/forum - Get trainer's own forum posts
+app.get("/api/trainer/forum", async (req, res) => {
+  try {
+    const { trainerId, email } = req.query;
+
+    let filter = {};
+    if (trainerId && email) filter = { $or: [{ authorId: trainerId }, { authorEmail: email }, { authorName: email }] };
+    else if (trainerId) filter = { authorId: trainerId };
+    else if (email) filter = { authorEmail: email };
+
+    const posts = await db.collection("forums").find(filter).sort({ createdAt: -1 }).toArray();
+
+    const formatted = posts.map((p) => ({
+      ...p,
+      id: p._id.toString(),
+    }));
+
+    res.json({ success: true, count: formatted.length, data: formatted });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// DELETE /api/trainer/forum/:id - Delete trainer's own forum post
+app.delete("/api/trainer/forum/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    let query = { _id: ObjectId.isValid(id) ? new ObjectId(id) : id };
+
+    await db.collection("forums").deleteOne(query);
+    await db.collection("forum_posts").deleteOne(query);
+    await db.collection("forum_comments").deleteMany({ postId: id });
+
+    res.json({ success: true, message: "Forum post deleted successfully." });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+
+// ----------------------------------------------------
 // USER & ROLE MANAGEMENT ENDPOINTS
 // ----------------------------------------------------
 
