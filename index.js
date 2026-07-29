@@ -83,25 +83,88 @@ app.get("/api/classes", async (req, res) => {
   }
 });
 
+// GET /api/classes/:id - Fetch single class by ID
+app.get("/api/classes/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    let query = { id };
+
+    if (ObjectId.isValid(id)) {
+      query = { $or: [{ _id: new ObjectId(id) }, { id }] };
+    }
+
+    const item = await db.collection("classes").findOne(query);
+    if (!item) {
+      return res.status(404).json({ success: false, error: "Class not found" });
+    }
+
+    res.json({ success: true, data: { ...item, id: item._id.toString() } });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// GET /api/bookings/check - Check if user has already booked a specific class
+app.get("/api/bookings/check", async (req, res) => {
+  try {
+    const { userId, classId, email } = req.query;
+
+    if (!classId || (!userId && !email)) {
+      return res.status(400).json({ success: false, error: "Missing userId/email or classId parameter" });
+    }
+
+    let filter = { classId };
+    if (userId && email) {
+      filter.$or = [{ userId }, { userEmail: email }, { "user.id": userId }];
+    } else if (userId) {
+      filter.$or = [{ userId }, { "user.id": userId }];
+    } else if (email) {
+      filter.userEmail = email;
+    }
+
+    const existingBooking = await db.collection("bookings").findOne(filter);
+
+    res.json({
+      success: true,
+      isBooked: !!existingBooking,
+      booking: existingBooking
+        ? {
+            ...existingBooking,
+            id: existingBooking._id.toString(),
+          }
+        : null,
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 
 // ----------------------------------------------------
 // FORUM ENDPOINTS
 // ----------------------------------------------------
 
-// GET /api/forum - Fetch forum posts
-app.get("/api/forum", async (req, res) => {
+// GET /api/forum & GET /api/forums - Fetch forum posts from MongoDB Atlas
+const getForumsHandler = async (req, res) => {
   try {
-    const posts = await db.collection("forum_posts").find({}).sort({ createdAt: -1 }).toArray();
+    // Check "forums" collection first as requested by user, fallback to "forum_posts"
+    let posts = await db.collection("forums").find({}).sort({ createdAt: -1 }).toArray();
+    if (!posts || posts.length === 0) {
+      posts = await db.collection("forum_posts").find({}).sort({ createdAt: -1 }).toArray();
+    }
     const formatted = posts.map((item) => ({
       ...item,
-      id: item._id.toString(),
+      id: item._id ? item._id.toString() : item.id,
     }));
 
     res.json({ success: true, count: formatted.length, data: formatted });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
-});
+};
+
+app.get("/api/forum", getForumsHandler);
+app.get("/api/forums", getForumsHandler);
 
 
 // ----------------------------------------------------
