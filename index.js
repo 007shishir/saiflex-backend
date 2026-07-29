@@ -470,6 +470,10 @@ app.post("/api/forum/:id/comments", async (req, res) => {
       return res.status(400).json({ success: false, error: "Comment text and author details are required." });
     }
 
+    if (await isUserBlocked(authorId, null)) {
+      return res.status(403).json({ success: false, error: "Action restricted by Admin" });
+    }
+
     const newComment = {
       postId: id,
       authorId,
@@ -692,6 +696,10 @@ app.post("/api/trainer-applications", async (req, res) => {
       return res.status(400).json({ success: false, error: "Experience and Specialty are required." });
     }
 
+    if (await isUserBlocked(userId, userEmail)) {
+      return res.status(403).json({ success: false, error: "Action restricted by Admin" });
+    }
+
     let appFilter = {};
     if (userId && userEmail) appFilter = { $or: [{ userId }, { userEmail }] };
     else if (userId) appFilter = { userId };
@@ -740,6 +748,347 @@ app.post("/api/trainer-applications", async (req, res) => {
         status: "Pending",
       });
     }
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+
+// Soft-block check helper: Check if user is blocked in "user" collection
+async function isUserBlocked(userId, userEmail) {
+  try {
+    let filter = {};
+    if (userId && userEmail) {
+      filter = { $or: [{ _id: ObjectId.isValid(userId) ? new ObjectId(userId) : userId }, { email: userEmail }] };
+    } else if (userId) {
+      filter = { _id: ObjectId.isValid(userId) ? new ObjectId(userId) : userId };
+    } else if (userEmail) {
+      filter = { email: userEmail };
+    }
+
+    const u = await db.collection("user").findOne(filter);
+    return u?.isBlocked === true;
+  } catch (err) {
+    return false;
+  }
+}
+
+// ----------------------------------------------------
+// ADMIN DASHBOARD ENDPOINTS
+// ----------------------------------------------------
+
+// GET /api/admin/stats - High level platform statistics
+app.get("/api/admin/stats", async (req, res) => {
+  try {
+    const totalUsers = await db.collection("user").countDocuments({});
+    let totalClasses = await db.collection("classes").countDocuments({});
+    const totalBooked = await db.collection("bookings").countDocuments({});
+
+    res.json({
+      success: true,
+      data: {
+        totalUsers,
+        totalClasses,
+        totalBooked,
+      },
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// GET /api/admin/users - Fetch all users with block & role status
+app.get("/api/admin/users", async (req, res) => {
+  try {
+    const users = await db.collection("user").find({}).sort({ createdAt: -1 }).toArray();
+    const formatted = users.map((u) => ({
+      id: u._id.toString(),
+      name: u.name || "User",
+      email: u.email,
+      role: u.role || "user",
+      isBlocked: u.isBlocked === true,
+      status: u.isBlocked === true ? "Blocked" : "Active",
+      image: u.image || "https://i.pravatar.cc/150",
+      createdAt: u.createdAt,
+    }));
+
+    res.json({ success: true, count: formatted.length, data: formatted });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// PATCH /api/admin/users/:id/block - Block or Unblock user (Soft Block)
+app.patch("/api/admin/users/:id/block", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { isBlocked } = req.body;
+
+    let query = { _id: ObjectId.isValid(id) ? new ObjectId(id) : id };
+    await db.collection("user").updateOne(query, {
+      $set: { isBlocked: !!isBlocked, updatedAt: new Date() },
+    });
+
+    res.json({
+      success: true,
+      message: isBlocked ? "User has been blocked." : "User has been unblocked.",
+      isBlocked: !!isBlocked,
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// PATCH /api/admin/users/:id/role - Promote user to Admin or change role
+app.patch("/api/admin/users/:id/role", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { role } = req.body;
+
+    if (!["user", "trainer", "admin"].includes(role)) {
+      return res.status(400).json({ success: false, error: "Invalid role" });
+    }
+
+    let query = { _id: ObjectId.isValid(id) ? new ObjectId(id) : id };
+    await db.collection("user").updateOne(query, {
+      $set: { role, updatedAt: new Date() },
+    });
+
+    res.json({
+      success: true,
+      message: `User role updated to ${role}.`,
+      role,
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// GET /api/admin/trainer-applications - Pending trainer applications
+app.get("/api/admin/trainer-applications", async (req, res) => {
+  try {
+    const applications = await db.collection("trainer_applications").find({}).sort({ createdAt: -1 }).toArray();
+    const formatted = applications.map((app) => ({
+      ...app,
+      id: app._id.toString(),
+    }));
+
+    res.json({ success: true, count: formatted.length, data: formatted });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// PATCH /api/admin/trainer-applications/:id - Approve or Reject application
+app.patch("/api/admin/trainer-applications/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { status, feedback } = req.body;
+
+    if (!["Approved", "Rejected"].includes(status)) {
+      return res.status(400).json({ success: false, error: "Invalid status value" });
+    }
+
+    let query = { _id: ObjectId.isValid(id) ? new ObjectId(id) : id };
+    const application = await db.collection("trainer_applications").findOne(query);
+
+    if (!application) {
+      return res.status(404).json({ success: false, error: "Application not found" });
+    }
+
+    await db.collection("trainer_applications").updateOne(query, {
+      $set: {
+        status,
+        feedback: feedback || null,
+        updatedAt: new Date(),
+      },
+    });
+
+    if (status === "Approved") {
+      let userQuery = {};
+      if (application.userId) {
+        userQuery = { _id: ObjectId.isValid(application.userId) ? new ObjectId(application.userId) : application.userId };
+      } else if (application.userEmail) {
+        userQuery = { email: application.userEmail };
+      }
+      await db.collection("user").updateOne(userQuery, { $set: { role: "trainer", updatedAt: new Date() } });
+    }
+
+    res.json({
+      success: true,
+      message: status === "Approved" ? "Trainer application approved! User promoted to Trainer." : "Trainer application rejected.",
+      status,
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// GET /api/admin/trainers - Active trainers list
+app.get("/api/admin/trainers", async (req, res) => {
+  try {
+    const trainers = await db.collection("user").find({ role: "trainer" }).toArray();
+    const formatted = trainers.map((t) => ({
+      id: t._id.toString(),
+      name: t.name || "Trainer",
+      email: t.email,
+      role: t.role,
+      image: t.image || "https://i.pravatar.cc/150",
+      createdAt: t.createdAt,
+    }));
+
+    res.json({ success: true, count: formatted.length, data: formatted });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// PATCH /api/admin/trainers/:id/demote - Demote trainer to user
+app.patch("/api/admin/trainers/:id/demote", async (req, res) => {
+  try {
+    const { id } = req.params;
+    let query = { _id: ObjectId.isValid(id) ? new ObjectId(id) : id };
+
+    await db.collection("user").updateOne(query, {
+      $set: { role: "user", updatedAt: new Date() },
+    });
+
+    res.json({
+      success: true,
+      message: "Trainer demoted to standard user.",
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// GET /api/admin/classes - Fetch all classes
+app.get("/api/admin/classes", async (req, res) => {
+  try {
+    const classesList = await db.collection("classes").find({}).sort({ createdAt: -1 }).toArray();
+    const formatted = classesList.map((c) => ({
+      ...c,
+      id: c._id.toString(),
+      status: c.status || "Approved",
+    }));
+
+    res.json({ success: true, count: formatted.length, data: formatted });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// PATCH /api/admin/classes/:id/status - Approve or Reject class
+app.patch("/api/admin/classes/:id/status", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { status } = req.body;
+
+    let query = { _id: ObjectId.isValid(id) ? new ObjectId(id) : id };
+    await db.collection("classes").updateOne(query, {
+      $set: { status, updatedAt: new Date() },
+    });
+
+    res.json({
+      success: true,
+      message: `Class status updated to ${status}.`,
+      status,
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// DELETE /api/admin/classes/:id - Delete class
+app.delete("/api/admin/classes/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    let query = { _id: ObjectId.isValid(id) ? new ObjectId(id) : id };
+
+    await db.collection("classes").deleteOne(query);
+
+    res.json({
+      success: true,
+      message: "Class deleted successfully.",
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// POST /api/admin/forum - Add Admin Forum Post
+app.post("/api/admin/forum", async (req, res) => {
+  try {
+    const { title, image, description, category, authorName, authorImage, authorRole } = req.body;
+
+    if (!title || !description) {
+      return res.status(400).json({ success: false, error: "Title and Description are required." });
+    }
+
+    const postDoc = {
+      title,
+      image: image || "https://images.unsplash.com/photo-1490645935967-10de6ba17061?q=80&w=800&auto=format&fit=crop",
+      description,
+      category: category || "General",
+      authorName: authorName || "Admin",
+      authorRole: authorRole || "Admin",
+      authorImage: authorImage || "https://i.pravatar.cc/150?u=admin",
+      likes: 0,
+      dislikes: 0,
+      commentsCount: 0,
+      date: new Date().toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" }),
+      readTime: "3 min read",
+      createdAt: new Date(),
+    };
+
+    const result = await db.collection("forums").insertOne(postDoc);
+    await db.collection("forum_posts").insertOne(postDoc);
+
+    res.status(201).json({
+      success: true,
+      message: "Forum post published successfully!",
+      id: result.insertedId.toString(),
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// DELETE /api/admin/forum/:id - Moderate/Delete forum post
+app.delete("/api/admin/forum/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    let query = { _id: ObjectId.isValid(id) ? new ObjectId(id) : id };
+
+    await db.collection("forums").deleteOne(query);
+    await db.collection("forum_posts").deleteOne(query);
+    await db.collection("forum_comments").deleteMany({ postId: id });
+
+    res.json({
+      success: true,
+      message: "Forum post deleted successfully.",
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// GET /api/admin/transactions - Payment histories
+app.get("/api/admin/transactions", async (req, res) => {
+  try {
+    const bookings = await db.collection("bookings").find({}).sort({ bookedAt: -1 }).toArray();
+
+    const formatted = bookings.map((b) => ({
+      id: b._id.toString(),
+      transactionId: b.transactionId || `tx_str_${b._id.toString().slice(-8)}`,
+      userEmail: b.userEmail || b.email || "user@example.com",
+      userName: b.userName || b.name || "Member",
+      className: b.className || "Fitness Class",
+      amount: b.price || 29.99,
+      date: b.bookedAt ? new Date(b.bookedAt).toLocaleDateString() : new Date().toLocaleDateString(),
+    }));
+
+    res.json({ success: true, count: formatted.length, data: formatted });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
