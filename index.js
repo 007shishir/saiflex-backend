@@ -889,7 +889,11 @@ app.patch("/api/admin/trainer-applications/:id", async (req, res) => {
       return res.status(400).json({ success: false, error: "Invalid status value" });
     }
 
-    let query = { _id: ObjectId.isValid(id) ? new ObjectId(id) : id };
+    let query = { id };
+    if (ObjectId.isValid(id)) {
+      query = { $or: [{ _id: new ObjectId(id) }, { id }] };
+    }
+
     const application = await db.collection("trainer_applications").findOne(query);
 
     if (!application) {
@@ -906,8 +910,8 @@ app.patch("/api/admin/trainer-applications/:id", async (req, res) => {
 
     if (status === "Approved") {
       let userQuery = {};
-      if (application.userId) {
-        userQuery = { _id: ObjectId.isValid(application.userId) ? new ObjectId(application.userId) : application.userId };
+      if (application.userId && ObjectId.isValid(application.userId)) {
+        userQuery = { $or: [{ _id: new ObjectId(application.userId) }, { email: application.userEmail }] };
       } else if (application.userEmail) {
         userQuery = { email: application.userEmail };
       }
@@ -947,7 +951,10 @@ app.get("/api/admin/trainers", async (req, res) => {
 app.patch("/api/admin/trainers/:id/demote", async (req, res) => {
   try {
     const { id } = req.params;
-    let query = { _id: ObjectId.isValid(id) ? new ObjectId(id) : id };
+    let query = { id };
+    if (ObjectId.isValid(id)) {
+      query = { $or: [{ _id: new ObjectId(id) }, { id }] };
+    }
 
     await db.collection("user").updateOne(query, {
       $set: { role: "user", updatedAt: new Date() },
@@ -984,7 +991,11 @@ app.patch("/api/admin/classes/:id/status", async (req, res) => {
     const { id } = req.params;
     const { status } = req.body;
 
-    let query = { _id: ObjectId.isValid(id) ? new ObjectId(id) : id };
+    let query = { id };
+    if (ObjectId.isValid(id)) {
+      query = { $or: [{ _id: new ObjectId(id) }, { id }] };
+    }
+
     await db.collection("classes").updateOne(query, {
       $set: { status, updatedAt: new Date() },
     });
@@ -1003,7 +1014,10 @@ app.patch("/api/admin/classes/:id/status", async (req, res) => {
 app.delete("/api/admin/classes/:id", async (req, res) => {
   try {
     const { id } = req.params;
-    let query = { _id: ObjectId.isValid(id) ? new ObjectId(id) : id };
+    let query = { id };
+    if (ObjectId.isValid(id)) {
+      query = { $or: [{ _id: new ObjectId(id) }, { id }] };
+    }
 
     await db.collection("classes").deleteOne(query);
 
