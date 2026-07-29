@@ -1,12 +1,15 @@
 const express = require("express");
 const cors = require("cors");
 const { MongoClient, ObjectId } = require("mongodb");
+const jwt = require("jsonwebtoken");
+const cookieParser = require("cookie-parser");
 require("dotenv").config();
 
 const app = express();
 const PORT = process.env.PORT || 5000;
 const MONGODB_URI = process.env.MONGODB_URI;
 const DB_NAME = process.env.DB_NAME || "saiflex-db";
+const JWT_SECRET = process.env.JWT_SECRET || "saiflex-jwt-secret-key-2026-secure";
 
 // Middleware
 app.use(
@@ -16,26 +19,89 @@ app.use(
   })
 );
 app.use(express.json());
+app.use(cookieParser());
+
+// ----------------------------------------------------
+// VERIFY TOKEN & ROLE PROTECTION MIDDLEWARE
+// ----------------------------------------------------
+const verifyToken = (req, res, next) => {
+  try {
+    const token =
+      req.cookies?.token ||
+      (req.headers.authorization && req.headers.authorization.startsWith("Bearer ")
+        ? req.headers.authorization.split(" ")[1]
+        : null);
+
+    if (!token) {
+      return res.status(401).json({ success: false, error: "Access Denied: No Token Provided" });
+    }
+
+    const decoded = jwt.verify(token, JWT_SECRET);
+    req.user = decoded;
+    next();
+  } catch (error) {
+    return res.status(401).json({ success: false, error: "Invalid or Expired JWT Token" });
+  }
+};
+
+const verifyRole = (...allowedRoles) => {
+  return (req, res, next) => {
+    if (!req.user || (!allowedRoles.includes(req.user.role) && req.user.role !== "admin")) {
+      return res.status(403).json({
+        success: false,
+        error: "Forbidden: You do not have permission to access this resource",
+      });
+    }
+    next();
+  };
+};
 
 let db;
 let client;
+let dbPromise = null;
 
 // Connect to MongoDB Atlas
 async function connectDB() {
-  try {
-    if (!MONGODB_URI) {
-      console.error("MONGODB_URI environment variable is missing in .env");
-      return;
-    }
-    client = new MongoClient(MONGODB_URI);
-    await client.connect();
-    db = client.db(DB_NAME);
-    console.log(`Connected to MongoDB Atlas: ${DB_NAME}`);
-  } catch (error) {
-    console.error("MongoDB Atlas connection error:", error);
+  const uri = process.env.MONGODB_URI;
+  if (!uri) {
+    console.error("MONGODB_URI environment variable is missing");
+    return null;
   }
+  if (db) return db;
+  if (!dbPromise) {
+    client = new MongoClient(uri);
+    dbPromise = client.connect().then(() => {
+      db = client.db(process.env.DB_NAME || "saiflex-db");
+      console.log(`Connected to MongoDB Atlas: ${process.env.DB_NAME || "saiflex-db"}`);
+      return db;
+    }).catch(err => {
+      dbPromise = null;
+      console.error("MongoDB Atlas connection error:", err);
+      throw err;
+    });
+  }
+  return dbPromise;
 }
-connectDB();
+
+// Middleware to ensure DB connection is established before handling requests
+app.use(async (req, res, next) => {
+  if (req.path === "/") return next(); // Skip DB requirement for health check root endpoint
+  try {
+    const database = await connectDB();
+    if (!database) {
+      return res.status(500).json({
+        success: false,
+        error: "Database connection failed. Please check MONGODB_URI environment variable in Vercel settings.",
+      });
+    }
+    next();
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: "MongoDB connection error: " + error.message,
+    });
+  }
+});
 
 // ----------------------------------------------------
 // Health Check Endpoint
@@ -50,34 +116,138 @@ app.get("/", (req, res) => {
 });
 
 // ----------------------------------------------------
+// JWT AUTHENTICATION ENDPOINTS
+// ----------------------------------------------------
+
+// POST /api/auth/jwt-login - Issue JWT Token & HttpOnly Cookie
+app.post("/api/auth/jwt-login", async (req, res) => {
+  try {
+    const { email, name, image } = req.body;
+    if (!email) {
+      return res.status(400).json({ success: false, error: "Email is required for login." });
+    }
+
+    let user = await db.collection("user").findOne({ email });
+
+    if (!user) {
+      const newUserDoc = {
+        name: name || email.split("@")[0],
+        email,
+        image: image || `https://i.pravatar.cc/150?u=${encodeURIComponent(email)}`,
+        role: "user",
+        isBlocked: false,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      };
+      const result = await db.collection("user").insertOne(newUserDoc);
+      user = { _id: result.insertedId, ...newUserDoc };
+    }
+
+    const payload = {
+      id: user._id.toString(),
+      email: user.email,
+      name: user.name,
+      role: user.role || "user",
+      isBlocked: !!user.isBlocked,
+    };
+
+    // Generate JWT Token (Expires in 7 days)
+    const token = jwt.sign(payload, JWT_SECRET, { expiresIn: "7d" });
+
+    // Store JWT securely in HTTPOnly Cookie
+    res.cookie("token", token, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === "production",
+      sameSite: process.env.NODE_ENV === "production" ? "none" : "lax",
+      maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
+    });
+
+    res.json({
+      success: true,
+      message: "Authentication successful! JWT stored in HttpOnly cookie.",
+      token,
+      user: payload,
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// POST /api/auth/logout - Clear HttpOnly Cookie
+app.post("/api/auth/logout", (req, res) => {
+  res.clearCookie("token", {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === "production",
+    sameSite: process.env.NODE_ENV === "production" ? "none" : "lax",
+  });
+  res.json({ success: true, message: "Logged out successfully! Token cleared." });
+});
+
+// GET /api/auth/me - Verify Current Token & Return User Payload
+app.get("/api/auth/me", verifyToken, (req, res) => {
+  res.json({ success: true, user: req.user });
+});
+
+// ----------------------------------------------------
 // CLASSES ENDPOINTS
 // ----------------------------------------------------
 
-// GET /api/classes - Fetch classes (Optional query: category, status, search)
+// GET /api/classes - Fetch classes (Optional query: category, status, search, page, limit)
 app.get("/api/classes", async (req, res) => {
   try {
-    const { category, status, search } = req.query;
+    const { category, status, search, page, limit } = req.query;
     let filter = {};
 
     if (status) {
       filter.status = status;
     }
 
+    // 1. Filter Functionality: Category filtering using MongoDB $in operator
     if (category && category !== "All") {
-      filter.category = category;
+      const categoryList = Array.isArray(category)
+        ? category
+        : category.split(",").map((c) => c.trim()).filter(Boolean);
+
+      if (categoryList.length > 0 && !categoryList.includes("All")) {
+        filter.category = {
+          $in: categoryList.map((cat) => new RegExp(`^${cat}$`, "i")),
+        };
+      }
     }
 
+    // 2. Search Functionality: Search by Class Name using MongoDB $regex operator
     if (search) {
       filter.className = { $regex: search, $options: "i" };
     }
 
-    const classes = await db.collection("classes").find(filter).toArray();
+    // 3. Server-Side Pagination: skip & limit
+    const pageNum = parseInt(page, 10) || 1;
+    const limitNum = parseInt(limit, 10) || 6;
+    const skip = (pageNum - 1) * limitNum;
+
+    const totalCount = await db.collection("classes").countDocuments(filter);
+    const totalPages = Math.ceil(totalCount / limitNum) || 1;
+
+    const classes = await db
+      .collection("classes")
+      .find(filter)
+      .skip(skip)
+      .limit(limitNum)
+      .toArray();
+
     const formatted = classes.map((item) => ({
       ...item,
       id: item._id.toString(),
     }));
 
-    res.json({ success: true, count: formatted.length, data: formatted });
+    res.json({
+      success: true,
+      count: formatted.length,
+      totalCount,
+      page: pageNum,
+      totalPages,
+      data: formatted,
+    });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
@@ -258,20 +428,44 @@ app.delete("/api/favorites", async (req, res) => {
 // FORUM ENDPOINTS
 // ----------------------------------------------------
 
-// GET /api/forum & GET /api/forums - Fetch forum posts from MongoDB Atlas
+// GET /api/forum & GET /api/forums - Fetch forum posts with Server-Side Pagination
 const getForumsHandler = async (req, res) => {
   try {
-    // Check "forums" collection first as requested by user, fallback to "forum_posts"
-    let posts = await db.collection("forums").find({}).sort({ createdAt: -1 }).toArray();
-    if (!posts || posts.length === 0) {
-      posts = await db.collection("forum_posts").find({}).sort({ createdAt: -1 }).toArray();
+    const { page, limit } = req.query;
+    const pageNum = parseInt(page, 10) || 1;
+    const limitNum = parseInt(limit, 10) || 6;
+    const skip = (pageNum - 1) * limitNum;
+
+    let colName = "forums";
+    let totalCount = await db.collection("forums").countDocuments({});
+    if (totalCount === 0) {
+      colName = "forum_posts";
+      totalCount = await db.collection("forum_posts").countDocuments({});
     }
+
+    const totalPages = Math.ceil(totalCount / limitNum) || 1;
+
+    const posts = await db
+      .collection(colName)
+      .find({})
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(limitNum)
+      .toArray();
+
     const formatted = posts.map((item) => ({
       ...item,
       id: item._id ? item._id.toString() : item.id,
     }));
 
-    res.json({ success: true, count: formatted.length, data: formatted });
+    res.json({
+      success: true,
+      count: formatted.length,
+      totalCount,
+      page: pageNum,
+      totalPages,
+      data: formatted,
+    });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
@@ -1379,3 +1573,5 @@ app.listen(PORT, () => {
   console.log(`🚀 SaiFlex Backend Server running on http://localhost:${PORT}`);
   console.log(`====================================================`);
 });
+
+module.exports = app;
