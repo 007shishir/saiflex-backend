@@ -567,6 +567,186 @@ app.delete("/api/forum/comments/:commentId", async (req, res) => {
 
 
 // ----------------------------------------------------
+// USER DASHBOARD ENDPOINTS
+// ----------------------------------------------------
+
+// GET /api/user/dashboard-summary - Get summary counters & trainer application status
+app.get("/api/user/dashboard-summary", async (req, res) => {
+  try {
+    const { userId, email } = req.query;
+    if (!userId && !email) {
+      return res.status(400).json({ success: false, error: "Missing userId or email parameter" });
+    }
+
+    let userFilter = {};
+    if (userId && email) userFilter = { $or: [{ userId }, { userEmail: email }] };
+    else if (userId) userFilter = { $or: [{ userId }, { "user.id": userId }] };
+    else if (email) userFilter = { userEmail: email };
+
+    // Total bookings count
+    const totalBookings = await db.collection("bookings").countDocuments(userFilter);
+
+    // Total favorites count
+    const totalFavorites = await db.collection("favorites").countDocuments(userFilter);
+
+    // Trainer Application Status
+    let appFilter = {};
+    if (userId && email) appFilter = { $or: [{ userId }, { userEmail: email }] };
+    else if (userId) appFilter = { userId };
+    else if (email) appFilter = { userEmail: email };
+
+    const application = await db.collection("trainer_applications").findOne(appFilter);
+
+    res.json({
+      success: true,
+      data: {
+        totalBookings,
+        totalFavorites,
+        trainerApplication: application
+          ? {
+              id: application._id.toString(),
+              status: application.status || "Pending",
+              feedback: application.feedback || null,
+              experience: application.experience || 0,
+              specialty: application.specialty || "",
+              appliedAt: application.createdAt,
+            }
+          : null,
+      },
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// GET /api/user/bookings - Get user's booked classes list
+app.get("/api/user/bookings", async (req, res) => {
+  try {
+    const { userId, email } = req.query;
+    if (!userId && !email) {
+      return res.status(400).json({ success: false, error: "Missing userId or email" });
+    }
+
+    let filter = {};
+    if (userId && email) filter = { $or: [{ userId }, { userEmail: email }] };
+    else if (userId) filter = { $or: [{ userId }, { "user.id": userId }] };
+    else if (email) filter = { userEmail: email };
+
+    const bookings = await db.collection("bookings").find(filter).sort({ bookedAt: -1 }).toArray();
+
+    const formatted = bookings.map((b) => ({
+      id: b._id.toString(),
+      classId: b.classId,
+      className: b.className || "Fitness Class",
+      trainerName: b.trainerName || "Trainer",
+      schedule: b.schedule || "Scheduled Session",
+      price: b.price || 0,
+      paymentStatus: b.paymentStatus || "Paid",
+      bookedAt: b.bookedAt || b.createdAt,
+    }));
+
+    res.json({ success: true, count: formatted.length, data: formatted });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// GET /api/user/favorites - Get user's favorite classes list
+app.get("/api/user/favorites", async (req, res) => {
+  try {
+    const { userId, email } = req.query;
+    if (!userId && !email) {
+      return res.status(400).json({ success: false, error: "Missing userId or email" });
+    }
+
+    let filter = {};
+    if (userId && email) filter = { $or: [{ userId }, { userEmail: email }] };
+    else if (userId) filter = { $or: [{ userId }, { "user.id": userId }] };
+    else if (email) filter = { userEmail: email };
+
+    const favs = await db.collection("favorites").find(filter).sort({ createdAt: -1 }).toArray();
+
+    const formatted = favs.map((f) => ({
+      id: f._id.toString(),
+      classId: f.classId,
+      classData: f.classData || {},
+      createdAt: f.createdAt,
+    }));
+
+    res.json({ success: true, count: formatted.length, data: formatted });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// POST /api/trainer-applications - Apply to become a trainer
+app.post("/api/trainer-applications", async (req, res) => {
+  try {
+    const { userId, userEmail, userName, userImage, experience, specialty, bio } = req.body;
+
+    if (!userId && !userEmail) {
+      return res.status(400).json({ success: false, error: "Missing user identification" });
+    }
+
+    if (!experience || !specialty) {
+      return res.status(400).json({ success: false, error: "Experience and Specialty are required." });
+    }
+
+    let appFilter = {};
+    if (userId && userEmail) appFilter = { $or: [{ userId }, { userEmail }] };
+    else if (userId) appFilter = { userId };
+    else appFilter = { userEmail };
+
+    const existingApp = await db.collection("trainer_applications").findOne(appFilter);
+
+    if (existingApp && (existingApp.status === "Pending" || existingApp.status === "Approved")) {
+      return res.status(400).json({
+        success: false,
+        error: `You already have an active application with status: ${existingApp.status}`,
+      });
+    }
+
+    const applicationDoc = {
+      userId: userId || null,
+      userEmail: userEmail || null,
+      userName: userName || "Applicant",
+      userImage: userImage || "https://i.pravatar.cc/150",
+      experience: Number(experience) || 1,
+      specialty: specialty,
+      bio: bio || "",
+      status: "Pending",
+      feedback: null,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    };
+
+    if (existingApp && existingApp.status === "Rejected") {
+      // Re-apply after rejection
+      await db.collection("trainer_applications").updateOne(
+        { _id: existingApp._id },
+        { $set: applicationDoc }
+      );
+      return res.json({
+        success: true,
+        message: "Trainer application re-submitted successfully!",
+        status: "Pending",
+      });
+    } else {
+      const result = await db.collection("trainer_applications").insertOne(applicationDoc);
+      return res.status(201).json({
+        success: true,
+        message: "Trainer application submitted successfully!",
+        id: result.insertedId.toString(),
+        status: "Pending",
+      });
+    }
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+
+// ----------------------------------------------------
 // USER & ROLE MANAGEMENT ENDPOINTS
 // ----------------------------------------------------
 
