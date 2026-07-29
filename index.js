@@ -280,6 +280,291 @@ const getForumsHandler = async (req, res) => {
 app.get("/api/forum", getForumsHandler);
 app.get("/api/forums", getForumsHandler);
 
+// GET /api/forum/:id - Fetch single forum post by ID
+app.get("/api/forum/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    let query = { id };
+
+    if (ObjectId.isValid(id)) {
+      query = { $or: [{ _id: new ObjectId(id) }, { id }] };
+    }
+
+    let post = await db.collection("forums").findOne(query);
+    if (!post) {
+      post = await db.collection("forum_posts").findOne(query);
+    }
+
+    if (!post) {
+      return res.status(404).json({ success: false, error: "Forum post not found" });
+    }
+
+    res.json({
+      success: true,
+      data: {
+        ...post,
+        id: post._id ? post._id.toString() : post.id,
+      },
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// GET /api/forum/:id/vote-status - Check user's vote on post
+app.get("/api/forum/:id/vote-status", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { userId, email } = req.query;
+
+    if (!userId && !email) {
+      return res.json({ success: true, userVote: null });
+    }
+
+    let filter = { postId: id };
+    if (userId && email) {
+      filter.$or = [{ userId }, { userEmail: email }];
+    } else if (userId) {
+      filter.userId = userId;
+    } else if (email) {
+      filter.userEmail = email;
+    }
+
+    const vote = await db.collection("forum_votes").findOne(filter);
+
+    res.json({
+      success: true,
+      userVote: vote ? vote.voteType : null,
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// POST /api/forum/:id/vote - Submit Like/Dislike vote (Strict 1 vote per user)
+app.post("/api/forum/:id/vote", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { userId, userEmail, voteType } = req.body;
+
+    if (!userId && !userEmail) {
+      return res.status(401).json({ success: false, error: "Unauthorized. Please log in to vote." });
+    }
+
+    if (!["like", "dislike"].includes(voteType)) {
+      return res.status(400).json({ success: false, error: "Invalid vote type" });
+    }
+
+    let filter = { postId: id };
+    if (userId && userEmail) {
+      filter.$or = [{ userId }, { userEmail }];
+    } else if (userId) {
+      filter.userId = userId;
+    } else {
+      filter.userEmail = userEmail;
+    }
+
+    const existingVote = await db.collection("forum_votes").findOne(filter);
+
+    let likesDelta = 0;
+    let dislikesDelta = 0;
+
+    if (existingVote) {
+      if (existingVote.voteType === voteType) {
+        // User clicked same vote -> Remove vote
+        await db.collection("forum_votes").deleteOne({ _id: existingVote._id });
+        if (voteType === "like") likesDelta = -1;
+        if (voteType === "dislike") dislikesDelta = -1;
+
+        let query = { _id: ObjectId.isValid(id) ? new ObjectId(id) : id };
+        await db.collection("forums").updateOne(query, { $inc: { likes: likesDelta, dislikes: dislikesDelta } });
+        await db.collection("forum_posts").updateOne(query, { $inc: { likes: likesDelta, dislikes: dislikesDelta } });
+
+        return res.json({
+          success: true,
+          userVote: null,
+          message: "Your vote has been removed.",
+        });
+      } else {
+        // User switched vote (e.g. dislike -> like)
+        await db.collection("forum_votes").updateOne(
+          { _id: existingVote._id },
+          { $set: { voteType, updatedAt: new Date() } }
+        );
+
+        if (voteType === "like") {
+          likesDelta = 1;
+          dislikesDelta = -1;
+        } else {
+          likesDelta = -1;
+          dislikesDelta = 1;
+        }
+
+        let query = { _id: ObjectId.isValid(id) ? new ObjectId(id) : id };
+        await db.collection("forums").updateOne(query, { $inc: { likes: likesDelta, dislikes: dislikesDelta } });
+        await db.collection("forum_posts").updateOne(query, { $inc: { likes: likesDelta, dislikes: dislikesDelta } });
+
+        return res.json({
+          success: true,
+          userVote: voteType,
+          message: `Vote updated to ${voteType}!`,
+        });
+      }
+    } else {
+      // New vote
+      const newVote = {
+        postId: id,
+        userId: userId || null,
+        userEmail: userEmail || null,
+        voteType,
+        createdAt: new Date(),
+      };
+
+      await db.collection("forum_votes").insertOne(newVote);
+
+      if (voteType === "like") likesDelta = 1;
+      if (voteType === "dislike") dislikesDelta = 1;
+
+      let query = { _id: ObjectId.isValid(id) ? new ObjectId(id) : id };
+      await db.collection("forums").updateOne(query, { $inc: { likes: likesDelta, dislikes: dislikesDelta } });
+      await db.collection("forum_posts").updateOne(query, { $inc: { likes: likesDelta, dislikes: dislikesDelta } });
+
+      return res.status(201).json({
+        success: true,
+        userVote: voteType,
+        message: `Successfully ${voteType}d this post!`,
+      });
+    }
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// GET /api/forum/:id/comments - Fetch comments & replies
+app.get("/api/forum/:id/comments", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const comments = await db.collection("forum_comments")
+      .find({ postId: id })
+      .sort({ createdAt: 1 })
+      .toArray();
+
+    const formatted = comments.map((c) => ({
+      ...c,
+      id: c._id.toString(),
+    }));
+
+    res.json({ success: true, count: formatted.length, data: formatted });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// POST /api/forum/:id/comments - Create a new comment or reply
+app.post("/api/forum/:id/comments", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { authorId, authorName, authorImage, authorRole, text, parentCommentId } = req.body;
+
+    if (!authorId || !text || !text.trim()) {
+      return res.status(400).json({ success: false, error: "Comment text and author details are required." });
+    }
+
+    const newComment = {
+      postId: id,
+      authorId,
+      authorName: authorName || "Member",
+      authorImage: authorImage || "https://i.pravatar.cc/150",
+      authorRole: authorRole || "user",
+      text: text.trim(),
+      parentCommentId: parentCommentId || null,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    };
+
+    const result = await db.collection("forum_comments").insertOne(newComment);
+
+    // Update comment count on post
+    let query = { _id: ObjectId.isValid(id) ? new ObjectId(id) : id };
+    await db.collection("forums").updateOne(query, { $inc: { commentsCount: 1 } });
+    await db.collection("forum_posts").updateOne(query, { $inc: { commentsCount: 1 } });
+
+    res.status(201).json({
+      success: true,
+      message: "Comment posted successfully!",
+      comment: {
+        ...newComment,
+        id: result.insertedId.toString(),
+      },
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// PATCH /api/forum/comments/:commentId - Edit own comment
+app.patch("/api/forum/comments/:commentId", async (req, res) => {
+  try {
+    const { commentId } = req.params;
+    const { authorId, text } = req.body;
+
+    if (!text || !text.trim()) {
+      return res.status(400).json({ success: false, error: "Comment text cannot be empty." });
+    }
+
+    let query = { _id: ObjectId.isValid(commentId) ? new ObjectId(commentId) : commentId };
+    const existing = await db.collection("forum_comments").findOne(query);
+
+    if (!existing) {
+      return res.status(404).json({ success: false, error: "Comment not found." });
+    }
+
+    if (existing.authorId !== authorId) {
+      return res.status(403).json({ success: false, error: "Unauthorized. You can only edit your own comments." });
+    }
+
+    await db.collection("forum_comments").updateOne(query, {
+      $set: { text: text.trim(), updatedAt: new Date(), isEdited: true },
+    });
+
+    res.json({ success: true, message: "Comment updated successfully!" });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// DELETE /api/forum/comments/:commentId - Delete own comment
+app.delete("/api/forum/comments/:commentId", async (req, res) => {
+  try {
+    const { commentId } = req.params;
+    const { authorId } = req.query;
+
+    let query = { _id: ObjectId.isValid(commentId) ? new ObjectId(commentId) : commentId };
+    const existing = await db.collection("forum_comments").findOne(query);
+
+    if (!existing) {
+      return res.status(404).json({ success: false, error: "Comment not found." });
+    }
+
+    if (existing.authorId !== authorId) {
+      return res.status(403).json({ success: false, error: "Unauthorized. You can only delete your own comments." });
+    }
+
+    await db.collection("forum_comments").deleteOne(query);
+
+    // Decrement commentsCount on post
+    if (existing.postId) {
+      let postQuery = { _id: ObjectId.isValid(existing.postId) ? new ObjectId(existing.postId) : existing.postId };
+      await db.collection("forums").updateOne(postQuery, { $inc: { commentsCount: -1 } });
+      await db.collection("forum_posts").updateOne(postQuery, { $inc: { commentsCount: -1 } });
+    }
+
+    res.json({ success: true, message: "Comment deleted successfully." });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 
 // ----------------------------------------------------
 // USER & ROLE MANAGEMENT ENDPOINTS
