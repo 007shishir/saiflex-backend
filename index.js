@@ -139,6 +139,120 @@ app.get("/api/bookings/check", async (req, res) => {
   }
 });
 
+// ----------------------------------------------------
+// FAVORITES ENDPOINTS
+// ----------------------------------------------------
+
+// GET /api/favorites/check - Check if a class is in user's favorites
+app.get("/api/favorites/check", async (req, res) => {
+  try {
+    const { userId, classId, email } = req.query;
+
+    if (!classId || (!userId && !email)) {
+      return res.status(400).json({ success: false, error: "Missing userId/email or classId parameter" });
+    }
+
+    let filter = { classId };
+    if (userId && email) {
+      filter.$or = [{ userId }, { userEmail: email }, { "user.id": userId }];
+    } else if (userId) {
+      filter.$or = [{ userId }, { "user.id": userId }];
+    } else if (email) {
+      filter.userEmail = email;
+    }
+
+    const existingFav = await db.collection("favorites").findOne(filter);
+
+    res.json({
+      success: true,
+      isFavorite: !!existingFav,
+      favorite: existingFav ? { ...existingFav, id: existingFav._id.toString() } : null,
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// POST /api/favorites - Add a class to user's favorites (prevents duplicates)
+app.post("/api/favorites", async (req, res) => {
+  try {
+    const { userId, userEmail, classId, classData } = req.body;
+
+    if (!classId || (!userId && !userEmail)) {
+      return res.status(400).json({ success: false, error: "Missing userId/email or classId" });
+    }
+
+    // Check for existing entry to prevent duplicates
+    let filter = { classId };
+    if (userId && userEmail) {
+      filter.$or = [{ userId }, { userEmail }, { "user.id": userId }];
+    } else if (userId) {
+      filter.$or = [{ userId }, { "user.id": userId }];
+    } else if (userEmail) {
+      filter.userEmail = userEmail;
+    }
+
+    const existing = await db.collection("favorites").findOne(filter);
+    if (existing) {
+      return res.json({
+        success: true,
+        isFavorite: true,
+        message: "Class is already in your favorites!",
+        id: existing._id.toString(),
+      });
+    }
+
+    const favoriteDoc = {
+      userId: userId || null,
+      userEmail: userEmail || null,
+      classId: classId,
+      classData: classData || {},
+      createdAt: new Date(),
+    };
+
+    const result = await db.collection("favorites").insertOne(favoriteDoc);
+
+    res.status(201).json({
+      success: true,
+      isFavorite: true,
+      message: "Successfully added to your favorites!",
+      id: result.insertedId.toString(),
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// DELETE /api/favorites - Remove a class from user's favorites
+app.delete("/api/favorites", async (req, res) => {
+  try {
+    const { userId, userEmail, classId } = req.query;
+
+    if (!classId || (!userId && !userEmail)) {
+      return res.status(400).json({ success: false, error: "Missing userId/email or classId" });
+    }
+
+    let filter = { classId };
+    if (userId && userEmail) {
+      filter.$or = [{ userId }, { userEmail }, { "user.id": userId }];
+    } else if (userId) {
+      filter.$or = [{ userId }, { "user.id": userId }];
+    } else if (userEmail) {
+      filter.userEmail = userEmail;
+    }
+
+    await db.collection("favorites").deleteOne(filter);
+
+    res.json({
+      success: true,
+      isFavorite: false,
+      message: "Removed from your favorites.",
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 
 // ----------------------------------------------------
 // FORUM ENDPOINTS
